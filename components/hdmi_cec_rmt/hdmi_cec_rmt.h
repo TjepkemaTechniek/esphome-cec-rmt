@@ -230,7 +230,7 @@ class HdmiCecRmt : public Component {
     CecFrame frame;
     uint8_t kind;  // 0 = RX, 1 = TX ok, 2 = TX NACK, 3 = TX error, 4 = TX lost arbitration
   };
-  static constexpr uint8_t HISTORY_SIZE = 64;
+  static constexpr uint8_t HISTORY_SIZE = 96;
   HistoryEntry history_[HISTORY_SIZE];
   uint8_t history_head_{0};
   uint8_t history_count_{0};
@@ -243,6 +243,10 @@ class HdmiCecRmt : public Component {
   uint32_t route_started_{0};
   uint32_t route_last_poll_{0};
   bool route_resent_{false};
+  uint16_t route_wait_mask_{0};  // devices that must be awake before we route (bit = logical address)
+  uint32_t route_awake_ms_{0};   // when they all were
+  uint32_t power_on_sent_ms_[16]{};  // last power-on command per logical address
+  bool route_needs_wait_(uint8_t la) const;
   uint8_t last_active_la_{0xFF};
   uint32_t last_active_ms_{0};
   std::string frame_to_string_(const CecFrame &frame) const;

@@ -1103,6 +1103,8 @@ void HdmiCecRmt::send(uint8_t destination, const std::vector<uint8_t> &data, int
 
 void HdmiCecRmt::power_on(uint8_t destination) {
   destination &= 0x0F;
+  if (destination < CEC_BROADCAST)
+    this->power_on_sent_ms_[destination] = millis() | 1;
   if (destination == 0 || destination == CEC_BROADCAST) {
     this->enqueue_frame_(this->la_, 0, {OP_IMAGE_VIEW_ON});
     this->schedule_power_check_(0);
@@ -1188,22 +1190,47 @@ void HdmiCecRmt::set_stream_path(uint16_t physical_address) {
   this->schedule_state_refresh_(true);
 }
 
+bool HdmiCecRmt::route_needs_wait_(uint8_t la) const {
+  const DeviceState &s = this->states_[la];
+  if (s.power == POWER_ON)
+    return false;
+  if (s.power == POWER_TO_ON)
+    return true;
+  // Woken by us a moment ago and not yet reported on (it may not have answered a poll yet).
+  return this->power_on_sent_ms_[la] != 0 && millis() - this->power_on_sent_ms_[la] < 15000;
+}
+
 void HdmiCecRmt::route_to(uint16_t physical_address, uint8_t la) {
   this->route_pa_ = physical_address;
   this->route_la_ = la;
   this->route_resent_ = false;
   this->route_started_ = millis();
   this->route_last_poll_ = 0;
-  this->suppress_active_request_until_ = millis() + 20000;  // nobody gets asked while we switch
-  if (la != 0xFF && la != 0 && la < CEC_BROADCAST && this->states_[la].power != POWER_ON) {
+  this->route_awake_ms_ = 0;
+  this->suppress_active_request_until_ = millis() + 25000;  // nobody gets asked while we switch
+  bool cec_source = la != 0xFF && la != 0 && la < CEC_BROADCAST;
+  if (cec_source && this->states_[la].power != POWER_ON) {
     ESP_LOGI(TAG, "Input %s: waking %s first", format_physical_address(physical_address).c_str(),
              this->display_name(la).c_str());
     this->power_on(la);
+  }
+  // Wait for everything that is still starting up: the source itself, and the TV and audio
+  // system, which do the switching. A TV or receiver that is still booting ignores
+  // <Set Stream Path>, and when it finishes it picks an input of its own (often the port of
+  // whoever woke it), so routing before then gets undone.
+  this->route_wait_mask_ = 0;
+  if (cec_source && this->states_[la].power != POWER_ON)
+    this->route_wait_mask_ |= 1u << la;
+  for (uint8_t sw : {(uint8_t) 0, (uint8_t) 5}) {
+    if (sw != la && this->states_[sw].present && this->route_needs_wait_(sw))
+      this->route_wait_mask_ |= 1u << sw;
+  }
+  if (this->route_wait_mask_ != 0) {
     this->route_phase_ = ROUTE_WAIT_POWER;
     return;
   }
   this->set_stream_path(physical_address);
-  this->route_phase_ = (la != 0xFF && la != 0) ? ROUTE_WAIT_CONFIRM : ROUTE_IDLE;
+  this->route_phase_ = ROUTE_WAIT_CONFIRM;
   this->route_started_ = millis();
 }
 
@@ -1212,29 +1239,51 @@ void HdmiCecRmt::route_tick_() {
     return;
   uint32_t now = millis();
   if (this->route_phase_ == ROUTE_WAIT_POWER) {
-    bool awake = this->states_[this->route_la_].power == POWER_ON;
-    if (!awake && now - this->route_started_ < 8000) {
+    for (uint8_t i = 0; i < CEC_BROADCAST; i++) {
+      if ((this->route_wait_mask_ & (1u << i)) && this->states_[i].power == POWER_ON)
+        this->route_wait_mask_ &= ~(1u << i);
+    }
+    bool awake = this->route_wait_mask_ == 0;
+    if (!awake && now - this->route_started_ < 15000) {
       if (now - this->route_last_poll_ >= 1000) {
         this->route_last_poll_ = now;
-        this->request_power_status(this->route_la_);
+        for (uint8_t i = 0; i < CEC_BROADCAST; i++) {
+          if (this->route_wait_mask_ & (1u << i))
+            this->request_power_status(i);
+        }
       }
       return;
     }
-    ESP_LOGI(TAG, "%s %s, routing to %s", this->display_name(this->route_la_).c_str(),
-             awake ? "is awake" : "did not report power on in 8 s", format_physical_address(this->route_pa_).c_str());
+    // Give a device that just came up a moment to finish its own start-up switching.
+    if (awake && this->route_awake_ms_ == 0)
+      this->route_awake_ms_ = now;
+    if (awake && now - this->route_awake_ms_ < 1500)
+      return;
+    ESP_LOGI(TAG, "%s, routing to %s", awake ? "Everything is awake" : "Not everything reported power on in 15 s",
+             format_physical_address(this->route_pa_).c_str());
     this->set_stream_path(this->route_pa_);
     this->route_phase_ = ROUTE_WAIT_CONFIRM;
     this->route_started_ = now;
     return;
   }
-  // ROUTE_WAIT_CONFIRM: the device should answer <Set Stream Path> with <Active Source>.
-  if (this->last_active_la_ == this->route_la_ && (int32_t) (this->last_active_ms_ - this->route_started_) >= 0) {
+  // ROUTE_WAIT_CONFIRM
+  bool cec_source = this->route_la_ != 0xFF && this->route_la_ != 0 && this->route_la_ < CEC_BROADCAST;
+  if (cec_source && this->last_active_la_ == this->route_la_ &&
+      (int32_t) (this->last_active_ms_ - this->route_started_) >= 0) {
     ESP_LOGI(TAG, "%s confirmed as active source", this->display_name(this->route_la_).c_str());
     this->route_phase_ = ROUTE_IDLE;
     return;
   }
   if (now - this->route_started_ < 3000)
     return;
+  if (!cec_source) {
+    // An input without CEC can't confirm anything. Say it once more: harmless if the switch
+    // already happened, and it overrides a late start-up switch of the TV or receiver.
+    ESP_LOGI(TAG, "Repeating Set Stream Path to %s", format_physical_address(this->route_pa_).c_str());
+    this->set_stream_path(this->route_pa_);
+    this->route_phase_ = ROUTE_IDLE;
+    return;
+  }
   // Some playback devices never answer <Set Stream Path>. Then the bus has no
   // active source and a receiver may fall back to its previous input. Announce it on the
   // device's behalf, which is what the device should have done itself.
@@ -1247,6 +1296,21 @@ void HdmiCecRmt::route_tick_() {
 }
 
 void HdmiCecRmt::record_(const CecFrame &frame, uint8_t kind) {
+  // Leave out our own routine traffic (polls, power and scan queries) so the history covers
+  // more of what matters. The answers to those queries are still recorded.
+  if (kind != 0 && frame.len >= 1) {
+    if (frame.len == 1)
+      return;
+    switch (frame.data[1]) {
+      case OP_GIVE_DEVICE_POWER_STATUS:
+      case 0x83:  // Give Physical Address
+      case 0x46:  // Give OSD Name
+      case 0x8C:  // Give Device Vendor ID
+        return;
+      default:
+        break;
+    }
+  }
   HistoryEntry &e = this->history_[this->history_head_];
   e.ms = millis();
   e.frame = frame;
