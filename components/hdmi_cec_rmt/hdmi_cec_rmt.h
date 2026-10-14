@@ -248,6 +248,9 @@ class HdmiCecRmt : public Component {
   uint16_t route_wait_mask_{0};
   uint16_t route_intruders_{0};   // source devices that claimed the input during the switch
   bool route_standby_intruders_{false};
+  uint32_t route_guard_until_{0};  // after a switch: sources that grab the input are sent back to standby
+  uint32_t route_guard_last_ms_{0};
+  void route_intruder_(uint8_t src, uint16_t pa);
   void route_finish_();  // devices that must be awake before we route (bit = logical address)
   uint32_t route_awake_ms_{0};   // when they all were
   uint32_t power_on_sent_ms_[16]{};  // last power-on command per logical address

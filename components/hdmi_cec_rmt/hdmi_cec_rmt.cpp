@@ -765,12 +765,9 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
         this->set_active_pa_(pa);
         this->last_active_la_ = src;
         this->last_active_ms_ = millis();
-        if (this->route_phase_ != ROUTE_IDLE && src != this->route_la_ && pa != this->route_pa_) {
-          ESP_LOGW(TAG, "%s claimed the source (%s) while switching to %s", this->display_name(src).c_str(),
-                   format_physical_address(pa).c_str(), format_physical_address(this->route_pa_).c_str());
-          if (src != 0 && src != 5 && src != this->la_ && src < CEC_BROADCAST)
-            this->route_intruders_ |= 1u << src;
-        }
+        if (src != this->route_la_ && pa != this->route_pa_ && src != 0 && src != 5 && src != this->la_ &&
+            src < CEC_BROADCAST)
+          this->route_intruder_(src, pa);
       }
       break;
     case OP_SET_STREAM_PATH:
@@ -1207,6 +1204,7 @@ void HdmiCecRmt::route_to(uint16_t physical_address, uint8_t la, bool standby_in
   this->route_pa_ = physical_address;
   this->route_intruders_ = 0;
   this->route_standby_intruders_ = standby_intruders;
+  this->route_guard_until_ = millis();  // a new switch ends the guard of the previous one
   this->route_la_ = la;
   this->route_resent_ = false;
   this->route_started_ = millis();
@@ -1300,8 +1298,31 @@ void HdmiCecRmt::route_tick_() {
   this->route_finish_();
 }
 
+void HdmiCecRmt::route_intruder_(uint8_t src, uint16_t pa) {
+  if (this->route_phase_ != ROUTE_IDLE) {
+    ESP_LOGW(TAG, "%s claimed the source (%s) while switching to %s", this->display_name(src).c_str(),
+             format_physical_address(pa).c_str(), format_physical_address(this->route_pa_).c_str());
+    this->route_intruders_ |= 1u << src;
+    return;
+  }
+  if (!this->route_standby_intruders_ || (int32_t) (millis() - this->route_guard_until_) >= 0)
+    return;
+  // Shortly after a switch: a device that was woken along with the TV announces itself late.
+  ESP_LOGW(TAG, "%s claimed the source (%s) right after the switch to %s; standby and route again",
+           this->display_name(src).c_str(), format_physical_address(pa).c_str(),
+           format_physical_address(this->route_pa_).c_str());
+  this->standby(src);
+  if (millis() - this->route_guard_last_ms_ > 1000) {
+    this->route_guard_last_ms_ = millis();
+    this->set_stream_path(this->route_pa_);
+  }
+}
+
 void HdmiCecRmt::route_finish_() {
   this->route_phase_ = ROUTE_IDLE;
+  this->route_guard_until_ = millis() + 30000;
+  if ((int32_t) (this->route_guard_until_ - this->suppress_active_request_until_) > 0)
+    this->suppress_active_request_until_ = this->route_guard_until_;
   if (!this->route_standby_intruders_ || this->route_intruders_ == 0)
     return;
   for (uint8_t i = 1; i < CEC_BROADCAST; i++) {
