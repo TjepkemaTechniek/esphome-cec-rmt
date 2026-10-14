@@ -24,6 +24,7 @@ static constexpr uint32_t ID_REFRESH_1 = 0x1300;
 static constexpr uint32_t ID_REFRESH_2 = 0x1301;
 static constexpr uint32_t ID_SETTLED_1 = 0x1302;
 static constexpr uint32_t ID_SETTLED_2 = 0x1303;
+static constexpr uint32_t ID_INFO_QUERY = 0x1400;  // + logical address
 
 // Opcodes used here
 static constexpr uint8_t OP_FEATURE_ABORT = 0x00;
@@ -944,21 +945,40 @@ void HdmiCecRmt::query_device_(uint8_t la) {
   if (this->query_pending_ & bit)
     return;  // a query round for this device is already queued
   this->query_pending_ |= bit;
-  this->enqueue_frame_(this->la_, la, {OP_GIVE_PHYSICAL_ADDRESS}, 2, [this, la](bool acked) {
+  DeviceState &s = this->states_[la];
+  if (la == 0 && s.physical_address == PA_UNKNOWN) {
+    s.physical_address = 0x0000;  // the TV is always 0.0.0.0
+    s.dirty = true;
+  }
+  // Power status and OSD name are answered directly to us. Only ask what we don't know yet.
+  this->enqueue_frame_(this->la_, la, {OP_GIVE_DEVICE_POWER_STATUS}, 2, [this, la](bool acked) {
     if (!acked)
       this->mark_absent_(la);
   });
-  this->enqueue_frame_(this->la_, la, {OP_GIVE_OSD_NAME}, 2);
-  this->enqueue_frame_(this->la_, la, {OP_GIVE_DEVICE_VENDOR_ID}, 2);
-  this->enqueue_frame_(this->la_, la, {OP_GIVE_DEVICE_POWER_STATUS}, 2,
-                       [this, bit](bool) { this->query_pending_ &= ~bit; });
+  if (s.osd_name.empty())
+    this->enqueue_frame_(this->la_, la, {OP_GIVE_OSD_NAME}, 2);
+  // <Report Physical Address> and <Device Vendor ID> are broadcasts, and some TVs treat them as
+  // "a device was just connected" and switch that device on. So ask them only once, and only
+  // while the device is on anyway; otherwise they are learned from the device's own messages.
+  this->enqueue_marker_([this, la, bit]() {
+    this->set_timeout(ID_INFO_QUERY + la, 1500, [this, la, bit]() {
+      this->query_pending_ &= ~bit;
+      const DeviceState &st = this->states_[la];
+      if (!st.present || st.power != POWER_ON)
+        return;
+      if (st.physical_address == PA_UNKNOWN)
+        this->enqueue_frame_(this->la_, la, {OP_GIVE_PHYSICAL_ADDRESS}, 2);
+      if (!st.vendor_known)
+        this->enqueue_frame_(this->la_, la, {OP_GIVE_DEVICE_VENDOR_ID}, 2);
+    });
+  });
 }
 
 void HdmiCecRmt::scan() {
   if (this->monitor_mode_ || this->scanning_ || !this->allocated_)
     return;
   this->scanning_ = true;
-  this->query_pending_ = 0;  // scan re-queries everything that answers
+  this->query_pending_ = 0;
   ESP_LOGI(TAG, "Scanning CEC bus...");
   for (uint8_t la = 0; la < CEC_BROADCAST; la++) {
     if (la == this->la_)
