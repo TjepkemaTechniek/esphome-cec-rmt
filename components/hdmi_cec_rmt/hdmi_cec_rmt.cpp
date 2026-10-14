@@ -1375,6 +1375,16 @@ void HdmiCecRmt::route_intruder_(uint8_t src, uint16_t pa) {
   this->announce_route_();
 }
 
+void HdmiCecRmt::off_guard_check_(uint8_t src) {
+  if (src == this->la_ || (int32_t) (millis() - this->off_guard_until_) >= 0 || this->off_guard_count_ >= 2 ||
+      millis() - this->off_guard_last_ms_ < 3000)
+    return;
+  ESP_LOGW(TAG, "%s woke up right after everything was switched off; standby again", this->display_name(src).c_str());
+  this->off_guard_count_++;
+  this->off_guard_last_ms_ = millis();
+  this->enqueue_frame_(this->la_, CEC_BROADCAST, {OP_STANDBY});
+}
+
 void HdmiCecRmt::route_finish_() {
   this->route_phase_ = ROUTE_IDLE;
   this->route_guard_until_ = millis() + 30000;
