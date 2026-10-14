@@ -765,6 +765,8 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
         this->set_active_pa_(pa);
         this->last_active_la_ = src;
         this->last_active_ms_ = millis();
+        if (src != this->la_ && pa != this->proxy_pa_)
+          this->proxy_pa_ = PA_UNKNOWN;
         if (src != this->route_la_ && pa != this->route_pa_ && src != 0 && src != 5 && src != this->la_ &&
             src < CEC_BROADCAST)
           this->route_intruder_(src, pa);
@@ -772,8 +774,15 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
       break;
     case OP_SET_STREAM_PATH:
     case OP_ROUTING_INFORMATION:
-      if (f.len >= 4)
-        this->set_active_pa_(static_cast<uint16_t>((d[2] << 8) | d[3]));
+      if (f.len >= 4) {
+        uint16_t pa = static_cast<uint16_t>((d[2] << 8) | d[3]);
+        // The TV routing somewhere else (e.g. the user picked a source) ends our stand-in role,
+        // except right after our own switch, when the guard deals with it.
+        if (src != this->la_ && f.opcode() == OP_SET_STREAM_PATH && pa != this->proxy_pa_ &&
+            (int32_t) (millis() - this->route_guard_until_) >= 0 && this->route_phase_ == ROUTE_IDLE)
+          this->proxy_pa_ = PA_UNKNOWN;
+        this->set_active_pa_(pa);
+      }
       this->schedule_state_refresh_();  // routing messages are hints; confirm who is really active
       break;
     case OP_ROUTING_CHANGE:
@@ -793,6 +802,7 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
       break;
     case OP_STANDBY:
       if (f.is_broadcast()) {
+        this->proxy_pa_ = PA_UNKNOWN;
         for (auto &st : this->states_) {
           if (st.present && st.power != POWER_STANDBY) {
             st.power = POWER_STANDBY;
@@ -826,6 +836,15 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
 void HdmiCecRmt::respond_(const CecFrame &f) {
   if (this->monitor_mode_ || this->la_ == CEC_BROADCAST || !f.has_opcode())
     return;
+  if (f.opcode() == OP_REQUEST_ACTIVE_SOURCE && f.is_broadcast() && f.initiator() != this->la_ &&
+      this->proxy_pa_ != PA_UNKNOWN) {
+    // We switched to an input without CEC: answer for it, so the TV doesn't pick a source of its own.
+    this->enqueue_frame_(this->la_, CEC_BROADCAST,
+                         {OP_ACTIVE_SOURCE, static_cast<uint8_t>(this->proxy_pa_ >> 8),
+                          static_cast<uint8_t>(this->proxy_pa_ & 0xFF)},
+                         5, nullptr, true);
+    return;
+  }
   if (f.destination() != this->la_)
     return;  // we only answer requests addressed to us
   uint8_t src = f.initiator();
@@ -1205,6 +1224,8 @@ void HdmiCecRmt::route_to(uint16_t physical_address, uint8_t la, bool standby_in
   this->route_intruders_ = 0;
   this->route_standby_intruders_ = standby_intruders;
   this->route_guard_until_ = millis();  // a new switch ends the guard of the previous one
+  this->route_guard_count_ = 0;
+  this->proxy_pa_ = PA_UNKNOWN;
   this->route_la_ = la;
   this->route_resent_ = false;
   this->route_started_ = millis();
@@ -1229,10 +1250,18 @@ void HdmiCecRmt::route_to(uint16_t physical_address, uint8_t la, bool standby_in
       this->route_wait_mask_ |= 1u << sw;
   }
   if (this->route_wait_mask_ != 0) {
+    if (!cec_source && physical_address != 0x0000) {
+      // One Touch Play for an input without CEC: announce it now, so a TV that is starting up
+      // knows where to go (else it goes back to the source it remembers).
+      this->proxy_pa_ = physical_address;
+      this->enqueue_frame_(this->la_, CEC_BROADCAST,
+                           {OP_ACTIVE_SOURCE, static_cast<uint8_t>(physical_address >> 8),
+                            static_cast<uint8_t>(physical_address & 0xFF)});
+    }
     this->route_phase_ = ROUTE_WAIT_POWER;
     return;
   }
-  this->set_stream_path(physical_address);
+  this->announce_route_();
   this->route_phase_ = ROUTE_WAIT_CONFIRM;
   this->route_started_ = millis();
 }
@@ -1264,7 +1293,7 @@ void HdmiCecRmt::route_tick_() {
       return;
     ESP_LOGI(TAG, "%s, routing to %s", awake ? "Everything is awake" : "Not everything reported power on in 15 s",
              format_physical_address(this->route_pa_).c_str());
-    this->set_stream_path(this->route_pa_);
+    this->announce_route_();
     this->route_phase_ = ROUTE_WAIT_CONFIRM;
     this->route_started_ = now;
     return;
@@ -1282,8 +1311,8 @@ void HdmiCecRmt::route_tick_() {
   if (!cec_source) {
     // An input without CEC can't confirm anything. Say it once more: harmless if the switch
     // already happened, and it overrides a late start-up switch of the TV or receiver.
-    ESP_LOGI(TAG, "Repeating Set Stream Path to %s", format_physical_address(this->route_pa_).c_str());
-    this->set_stream_path(this->route_pa_);
+    ESP_LOGI(TAG, "Repeating the switch to %s", format_physical_address(this->route_pa_).c_str());
+    this->announce_route_();
     this->route_finish_();
     return;
   }
@@ -1305,16 +1334,18 @@ void HdmiCecRmt::route_intruder_(uint8_t src, uint16_t pa) {
     this->route_intruders_ |= 1u << src;
     return;
   }
-  if (!this->route_standby_intruders_ || (int32_t) (millis() - this->route_guard_until_) >= 0)
+  if (!this->route_standby_intruders_ || (int32_t) (millis() - this->route_guard_until_) >= 0 ||
+      this->route_guard_count_ >= 2)
     return;
   // Shortly after a switch: a device that was woken along with the TV announces itself late.
   ESP_LOGW(TAG, "%s claimed the source (%s) right after the switch to %s; standby and route again",
            this->display_name(src).c_str(), format_physical_address(pa).c_str(),
            format_physical_address(this->route_pa_).c_str());
   this->standby(src);
-  if (millis() - this->route_guard_last_ms_ > 1000) {
+  if (this->route_guard_count_ < 2 && millis() - this->route_guard_last_ms_ > 1000) {
+    this->route_guard_count_++;
     this->route_guard_last_ms_ = millis();
-    this->set_stream_path(this->route_pa_);
+    this->announce_route_();
   }
 }
 
@@ -1332,6 +1363,20 @@ void HdmiCecRmt::route_finish_() {
     }
   }
   this->route_intruders_ = 0;
+}
+
+void HdmiCecRmt::announce_route_() {
+  bool cec_source = this->route_la_ != 0xFF && this->route_la_ != 0 && this->route_la_ < CEC_BROADCAST;
+  if (!cec_source && this->route_pa_ != 0x0000) {
+    // An input without CEC can't do One Touch Play itself, so we do it on its behalf: announce it
+    // as the active source. Without an active source a TV that just woke up routes to the last
+    // source it remembers (and wakes that device), or to whoever sent it <Image View On>.
+    this->proxy_pa_ = this->route_pa_;
+    this->enqueue_frame_(this->la_, CEC_BROADCAST,
+                         {OP_ACTIVE_SOURCE, static_cast<uint8_t>(this->route_pa_ >> 8),
+                          static_cast<uint8_t>(this->route_pa_ & 0xFF)});
+  }
+  this->set_stream_path(this->route_pa_);
 }
 
 void HdmiCecRmt::record_(const CecFrame &frame, uint8_t kind) {
