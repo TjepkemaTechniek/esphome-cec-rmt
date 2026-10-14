@@ -22,6 +22,8 @@ static constexpr uint32_t ID_POWER_CHECK_2 = 0x1100;  // + logical address
 static constexpr uint32_t ID_SET_SOURCE_RETRY = 0x1200;
 static constexpr uint32_t ID_REFRESH_1 = 0x1300;
 static constexpr uint32_t ID_REFRESH_2 = 0x1301;
+static constexpr uint32_t ID_SETTLED_1 = 0x1302;
+static constexpr uint32_t ID_SETTLED_2 = 0x1303;
 
 // Opcodes used here
 static constexpr uint8_t OP_FEATURE_ABORT = 0x00;
@@ -1237,6 +1239,14 @@ void HdmiCecRmt::route_to(uint16_t physical_address, uint8_t la, bool standby_in
   this->route_pa_ = physical_address;
   this->route_intruders_ = 0;
   this->route_standby_intruders_ = standby_intruders;
+  this->route_were_off_ = 0;
+  for (uint8_t i = 1; i < CEC_BROADCAST; i++) {
+    if (i != 5 && i != la && i != this->la_ && this->states_[i].present && this->states_[i].power != POWER_ON &&
+        this->states_[i].power != POWER_TO_ON)
+      this->route_were_off_ |= 1u << i;
+  }
+  this->cancel_timeout(ID_SETTLED_1);
+  this->cancel_timeout(ID_SETTLED_2);
   this->route_guard_until_ = millis();  // a new switch ends the guard of the previous one
   this->route_guard_count_ = 0;
   this->proxy_pa_ = PA_UNKNOWN;
@@ -1349,29 +1359,20 @@ void HdmiCecRmt::route_intruder_(uint8_t src, uint16_t pa) {
     this->route_intruders_ |= 1u << src;
     return;
   }
-  if (!this->route_standby_intruders_ || (int32_t) (millis() - this->route_guard_until_) >= 0 ||
-      this->route_guard_count_ >= 2)
+  if (!this->route_standby_intruders_ || (int32_t) (millis() - this->route_guard_until_) >= 0)
+    return;
+  this->route_intruders_ |= 1u << src;
+  if (this->route_guard_count_ >= 2 || millis() - this->route_guard_last_ms_ <= 1000)
     return;
   // Shortly after a switch: a device that was woken along with the TV announces itself late.
-  ESP_LOGW(TAG, "%s claimed the source (%s) right after the switch to %s; standby and route again",
+  // Take the input back now; the device itself is put to sleep once the TV has settled
+  // (a TV that is still starting up wakes it again otherwise).
+  ESP_LOGW(TAG, "%s claimed the source (%s) right after the switch to %s; routing again",
            this->display_name(src).c_str(), format_physical_address(pa).c_str(),
            format_physical_address(this->route_pa_).c_str());
-  this->standby(src);
-  if (this->route_guard_count_ < 2 && millis() - this->route_guard_last_ms_ > 1000) {
-    this->route_guard_count_++;
-    this->route_guard_last_ms_ = millis();
-    this->announce_route_();
-  }
-}
-
-void HdmiCecRmt::off_guard_check_(uint8_t src) {
-  if (src == this->la_ || (int32_t) (millis() - this->off_guard_until_) >= 0 || this->off_guard_count_ >= 2 ||
-      millis() - this->off_guard_last_ms_ < 3000)
-    return;
-  ESP_LOGW(TAG, "%s woke up right after everything was switched off; standby again", this->display_name(src).c_str());
-  this->off_guard_count_++;
-  this->off_guard_last_ms_ = millis();
-  this->enqueue_frame_(this->la_, CEC_BROADCAST, {OP_STANDBY});
+  this->route_guard_count_++;
+  this->route_guard_last_ms_ = millis();
+  this->announce_route_();
 }
 
 void HdmiCecRmt::route_finish_() {
@@ -1379,15 +1380,29 @@ void HdmiCecRmt::route_finish_() {
   this->route_guard_until_ = millis() + 30000;
   if ((int32_t) (this->route_guard_until_ - this->suppress_active_request_until_) > 0)
     this->suppress_active_request_until_ = this->route_guard_until_;
-  if (!this->route_standby_intruders_ || this->route_intruders_ == 0)
+  if (!this->route_standby_intruders_)
     return;
+  // Devices woken along the way (typically by a TV that powers up its last source) are put back
+  // in standby once the TV has finished starting up, and checked once more after that.
+  this->set_timeout(ID_SETTLED_1, 30000, [this]() { this->route_settled_standby_(); });
+  this->set_timeout(ID_SETTLED_2, 60000, [this]() { this->route_settled_standby_(); });
+}
+
+void HdmiCecRmt::route_settled_standby_() {
+  if (this->active_pa_ != this->route_pa_) {
+    ESP_LOGD(TAG, "Input changed since the switch; leaving other devices alone");
+    return;
+  }
+  uint16_t candidates = this->route_intruders_ | this->route_were_off_;
   for (uint8_t i = 1; i < CEC_BROADCAST; i++) {
-    if (this->route_intruders_ & (1u << i)) {
+    if (!(candidates & (1u << i)) || i == this->route_la_ || i == 5 || i == this->la_)
+      continue;
+    const DeviceState &st = this->states_[i];
+    if (st.present && (st.power == POWER_ON || st.power == POWER_TO_ON)) {
       ESP_LOGI(TAG, "%s woke up during the switch; putting it back in standby", this->display_name(i).c_str());
       this->standby(i);
     }
   }
-  this->route_intruders_ = 0;
 }
 
 void HdmiCecRmt::announce_route_() {

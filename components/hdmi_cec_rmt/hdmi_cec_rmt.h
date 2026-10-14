@@ -261,7 +261,9 @@ class HdmiCecRmt : public Component {
   uint16_t proxy_pa_{PA_UNKNOWN};
   void announce_route_();
   void route_intruder_(uint8_t src, uint16_t pa);
-  void route_finish_();  // devices that must be awake before we route (bit = logical address)
+  void route_finish_();
+  uint16_t route_were_off_{0};    // source devices that were off when the switch started
+  void route_settled_standby_();  // devices that must be awake before we route (bit = logical address)
   uint32_t route_awake_ms_{0};   // when they all were
   uint32_t power_on_sent_ms_[16]{};  // last power-on command per logical address
   bool route_needs_wait_(uint8_t la) const;
