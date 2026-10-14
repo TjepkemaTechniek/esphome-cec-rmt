@@ -251,6 +251,12 @@ class HdmiCecRmt : public Component {
   uint32_t route_guard_until_{0};  // after a switch: sources that grab the input are sent back to standby
   uint32_t route_guard_last_ms_{0};
   uint8_t route_guard_count_{0};
+  // After we put everything in standby: devices that wake up by themselves (e.g. woken by the
+  // TV on its way to standby) are sent back to standby.
+  uint32_t off_guard_until_{0};
+  uint32_t off_guard_last_ms_{0};
+  uint8_t off_guard_count_{0};
+  void off_guard_check_(uint8_t src);
   // Input without CEC that we stand in for as active source (One Touch Play on its behalf), or PA_UNKNOWN
   uint16_t proxy_pa_{PA_UNKNOWN};
   void announce_route_();

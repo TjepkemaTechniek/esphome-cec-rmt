@@ -767,6 +767,7 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
         this->last_active_ms_ = millis();
         if (src != this->la_ && pa != this->proxy_pa_)
           this->proxy_pa_ = PA_UNKNOWN;
+        this->off_guard_check_(src);
         if (src != this->route_la_ && pa != this->route_pa_ && src != 0 && src != 5 && src != this->la_ &&
             src < CEC_BROADCAST)
           this->route_intruder_(src, pa);
@@ -822,6 +823,7 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
         this->states_[0].power = POWER_ON;
         this->states_[0].dirty = true;
       }
+      this->off_guard_check_(src);
       this->schedule_state_refresh_();  // one-touch play: other devices usually wake too
       break;
     case OP_FEATURE_ABORT:
@@ -1124,6 +1126,7 @@ void HdmiCecRmt::power_on(uint8_t destination) {
   destination &= 0x0F;
   if (destination < CEC_BROADCAST)
     this->power_on_sent_ms_[destination] = millis() | 1;
+  this->off_guard_until_ = millis();  // the user wants something on
   if (destination == 0 || destination == CEC_BROADCAST) {
     this->enqueue_frame_(this->la_, 0, {OP_IMAGE_VIEW_ON});
     this->schedule_power_check_(0);
@@ -1137,6 +1140,10 @@ void HdmiCecRmt::power_on(uint8_t destination) {
 void HdmiCecRmt::standby(uint8_t destination) {
   destination &= 0x0F;
   this->enqueue_frame_(this->la_, destination, {OP_STANDBY});
+  if (destination == CEC_BROADCAST && (int32_t) (millis() - this->off_guard_until_) >= 0) {
+    this->off_guard_until_ = millis() + 25000;
+    this->off_guard_count_ = 0;
+  }
   this->schedule_state_refresh_(true);
   if (destination == CEC_BROADCAST) {
     for (auto *dev : this->devices_)
@@ -1226,6 +1233,7 @@ void HdmiCecRmt::route_to(uint16_t physical_address, uint8_t la, bool standby_in
   this->route_guard_until_ = millis();  // a new switch ends the guard of the previous one
   this->route_guard_count_ = 0;
   this->proxy_pa_ = PA_UNKNOWN;
+  this->off_guard_until_ = millis();
   this->route_la_ = la;
   this->route_resent_ = false;
   this->route_started_ = millis();
@@ -1347,6 +1355,16 @@ void HdmiCecRmt::route_intruder_(uint8_t src, uint16_t pa) {
     this->route_guard_last_ms_ = millis();
     this->announce_route_();
   }
+}
+
+void HdmiCecRmt::off_guard_check_(uint8_t src) {
+  if (src == this->la_ || (int32_t) (millis() - this->off_guard_until_) >= 0 || this->off_guard_count_ >= 2 ||
+      millis() - this->off_guard_last_ms_ < 3000)
+    return;
+  ESP_LOGW(TAG, "%s woke up right after everything was switched off; standby again", this->display_name(src).c_str());
+  this->off_guard_count_++;
+  this->off_guard_last_ms_ = millis();
+  this->enqueue_frame_(this->la_, CEC_BROADCAST, {OP_STANDBY});
 }
 
 void HdmiCecRmt::route_finish_() {
