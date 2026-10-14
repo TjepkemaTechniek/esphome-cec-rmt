@@ -815,6 +815,13 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
         this->states_[dst].power = POWER_STANDBY;
         this->states_[dst].dirty = true;
       }
+      // The TV is going to standby (told by anyone, e.g. a playback device's remote, or the TV
+      // putting the system to sleep): some TVs wake a playback device on the way down, which
+      // then turns everything back on. Guard against that, like after our own "everything off".
+      if ((f.is_broadcast() || dst == 0 || src == 0) && (int32_t) (millis() - this->off_guard_until_) >= 0) {
+        this->off_guard_until_ = millis() + 20000;
+        this->off_guard_count_ = 0;
+      }
       this->schedule_state_refresh_();
       break;
     case OP_IMAGE_VIEW_ON:
@@ -1141,7 +1148,7 @@ void HdmiCecRmt::standby(uint8_t destination) {
   destination &= 0x0F;
   this->enqueue_frame_(this->la_, destination, {OP_STANDBY});
   if (destination == CEC_BROADCAST && (int32_t) (millis() - this->off_guard_until_) >= 0) {
-    this->off_guard_until_ = millis() + 25000;
+    this->off_guard_until_ = millis() + 20000;
     this->off_guard_count_ = 0;
   }
   this->schedule_state_refresh_(true);
