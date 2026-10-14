@@ -765,9 +765,12 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
         this->set_active_pa_(pa);
         this->last_active_la_ = src;
         this->last_active_ms_ = millis();
-        if (this->route_phase_ != ROUTE_IDLE && src != this->route_la_)
+        if (this->route_phase_ != ROUTE_IDLE && src != this->route_la_ && pa != this->route_pa_) {
           ESP_LOGW(TAG, "%s claimed the source (%s) while switching to %s", this->display_name(src).c_str(),
                    format_physical_address(pa).c_str(), format_physical_address(this->route_pa_).c_str());
+          if (src != 0 && src != 5 && src != this->la_ && src < CEC_BROADCAST)
+            this->route_intruders_ |= 1u << src;
+        }
       }
       break;
     case OP_SET_STREAM_PATH:
@@ -1200,8 +1203,10 @@ bool HdmiCecRmt::route_needs_wait_(uint8_t la) const {
   return this->power_on_sent_ms_[la] != 0 && millis() - this->power_on_sent_ms_[la] < 15000;
 }
 
-void HdmiCecRmt::route_to(uint16_t physical_address, uint8_t la) {
+void HdmiCecRmt::route_to(uint16_t physical_address, uint8_t la, bool standby_intruders) {
   this->route_pa_ = physical_address;
+  this->route_intruders_ = 0;
+  this->route_standby_intruders_ = standby_intruders;
   this->route_la_ = la;
   this->route_resent_ = false;
   this->route_started_ = millis();
@@ -1271,7 +1276,7 @@ void HdmiCecRmt::route_tick_() {
   if (cec_source && this->last_active_la_ == this->route_la_ &&
       (int32_t) (this->last_active_ms_ - this->route_started_) >= 0) {
     ESP_LOGI(TAG, "%s confirmed as active source", this->display_name(this->route_la_).c_str());
-    this->route_phase_ = ROUTE_IDLE;
+    this->route_finish_();
     return;
   }
   if (now - this->route_started_ < 3000)
@@ -1281,7 +1286,7 @@ void HdmiCecRmt::route_tick_() {
     // already happened, and it overrides a late start-up switch of the TV or receiver.
     ESP_LOGI(TAG, "Repeating Set Stream Path to %s", format_physical_address(this->route_pa_).c_str());
     this->set_stream_path(this->route_pa_);
-    this->route_phase_ = ROUTE_IDLE;
+    this->route_finish_();
     return;
   }
   // Some playback devices never answer <Set Stream Path>. Then the bus has no
@@ -1292,7 +1297,20 @@ void HdmiCecRmt::route_tick_() {
   this->enqueue_frame_(this->route_la_, CEC_BROADCAST,
                        {OP_ACTIVE_SOURCE, static_cast<uint8_t>(this->route_pa_ >> 8),
                         static_cast<uint8_t>(this->route_pa_ & 0xFF)});
+  this->route_finish_();
+}
+
+void HdmiCecRmt::route_finish_() {
   this->route_phase_ = ROUTE_IDLE;
+  if (!this->route_standby_intruders_ || this->route_intruders_ == 0)
+    return;
+  for (uint8_t i = 1; i < CEC_BROADCAST; i++) {
+    if (this->route_intruders_ & (1u << i)) {
+      ESP_LOGI(TAG, "%s woke up during the switch; putting it back in standby", this->display_name(i).c_str());
+      this->standby(i);
+    }
+  }
+  this->route_intruders_ = 0;
 }
 
 void HdmiCecRmt::record_(const CecFrame &frame, uint8_t kind) {

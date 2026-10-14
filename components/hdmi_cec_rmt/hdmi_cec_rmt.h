@@ -174,7 +174,9 @@ class HdmiCecRmt : public Component {
   /// Switch to an input: wakes the CEC device on it first (if given and asleep), waits until it
   /// reports power on, then routes with <Set Stream Path> and re-sends once if the device does
   /// not announce itself as active source. la = 0xFF for inputs without a CEC device.
-  void route_to(uint16_t physical_address, uint8_t la);
+  /// Switch the TV/receiver to an input. With standby_intruders, a source device that
+  /// claims the input while we switch (e.g. one the TV wakes along with itself) is put back in standby.
+  void route_to(uint16_t physical_address, uint8_t la, bool standby_intruders = false);
   /// Print the last frames (RX and TX results) with timestamps to the log.
   void dump_history();
   void scan();
@@ -243,7 +245,10 @@ class HdmiCecRmt : public Component {
   uint32_t route_started_{0};
   uint32_t route_last_poll_{0};
   bool route_resent_{false};
-  uint16_t route_wait_mask_{0};  // devices that must be awake before we route (bit = logical address)
+  uint16_t route_wait_mask_{0};
+  uint16_t route_intruders_{0};   // source devices that claimed the input during the switch
+  bool route_standby_intruders_{false};
+  void route_finish_();  // devices that must be awake before we route (bit = logical address)
   uint32_t route_awake_ms_{0};   // when they all were
   uint32_t power_on_sent_ms_[16]{};  // last power-on command per logical address
   bool route_needs_wait_(uint8_t la) const;

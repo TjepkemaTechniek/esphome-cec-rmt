@@ -136,7 +136,7 @@ class CecSourceSelect : public select::Select, public Parented<HdmiCecRmt> {
       }
     }
     // Wake (if needed) -> route -> confirm; see HdmiCecRmt::route_to().
-    this->parent_->route_to(pa, target_la);
+    this->parent_->route_to(pa, target_la, this->standby_previous_);
     // Not optimistic: the state follows once the switch is reflected on the bus / in our tracking.
   }
 
