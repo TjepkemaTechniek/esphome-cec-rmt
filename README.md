@@ -10,6 +10,11 @@ HDMI-CEC for ESPHome on ESP32 (ESP-IDF 5.5+), with proper ACK handling.
   lost arbitration or a NACK.
 - The pin is open-drain with input enabled, so every transmission is read back: ACK/NACK
   detection, arbitration and readback verification come for free.
+- **Passive by default** – it never polls the bus. Devices, names, power state and the active
+  source are learned from the traffic between the other devices. It ACKs and answers what is
+  addressed to it, and only transmits for commands you give.
+- **Devices are found by who they are**, not by a fixed logical address: an Apple TV is the
+  Apple TV whether it ends up at playback 1, 2 or 3.
 
 Developed on ESP32-S3; the code only uses driver/HAL APIs that also exist on ESP32-P4.
 
@@ -43,9 +48,10 @@ hdmi_cec_rmt:
     - id: tv
       logical_address: 0
       name: TV
-    - id: player
-      logical_address: 4
-      name: Media player
+    - id: apple_tv               # no logical_address: found on the bus
+      name: Apple TV
+      vendor_id: 0x0010FA
+      osd_name: Apple TV
 ```
 
 A complete Home Assistant controller config is in [`examples/cec-controller.yaml`](examples/cec-controller.yaml).
@@ -61,17 +67,27 @@ A complete Home Assistant controller config is in [`examples/cec-controller.yaml
 | `osd_name` | `ESPHome` | Max 14 chars |
 | `vendor_id` | `0` | 24-bit IEEE OUI |
 | `promiscuous` | `true` | Decode and report traffic between other devices (needed to track state) |
+| `passive` | `true` | Never poll: no boot-time announcements, scans, power polls or state refreshes. Still ACKs and answers requests addressed to us. After a command it only asks the addressed device for its power status |
 | `monitor_mode` | `false` | Never drive the bus: no ACK, no TX |
-| `scan_interval` | `5min` | Full poll of addresses 0–14; also runs at boot. `never` disables |
-| `power_poll_interval` | `60s` | `<Give Device Power Status>` to configured devices |
+| `scan_interval` | `never` (passive) / `5min` | Full poll of addresses 0–14; also runs at boot |
+| `power_poll_interval` | `never` (passive) / `60s` | `<Give Device Power Status>` to configured devices |
 | `source_switch_method` | `set_stream_path` | `set_stream_path`, `active_source` (sends it on behalf of the device), or `both` |
-| `devices` | `[]` | Devices that get entities |
+| `devices` | `[]` | Devices that get entities: `id`, `name`, and either `logical_address` or any of `vendor_id`, `osd_name`, `device_type` (`tv`, `recorder`, `tuner`, `playback`, `audio_system`) to find it on the bus. Every property that is known must match; the last address is remembered across reboots |
 | `on_message` | | Trigger with `source`, `destination`, `data` (opcode first). Filters: `source`, `destination`, `opcode`, `data` |
 | `on_device_discovered` | | A device not in `devices:` showed up in a scan: `logical_address`, `physical_address`, `osd_name` |
 
 ### Actions
 
+Every action that takes a `destination` (logical address) also takes `device:` (an id from
+`devices:`), and `key` takes names as well as codes.
+
 ```yaml
+- hdmi_cec_rmt.command:         # by name; meant for Home Assistant actions
+    device: "Apple TV"          # YAML name, CEC OSD name, "TV", "Playback 1", "all", or 0-15
+    command: play               # on, standby, switch_to, power_status, or a key name
+- hdmi_cec_rmt.user_control:
+    device: apple_tv
+    key: select
 - hdmi_cec_rmt.send:            # raw frame; data = opcode + operands, [] = poll
     destination: 0
     data: [0x04]
@@ -90,7 +106,32 @@ A complete Home Assistant controller config is in [`examples/cec-controller.yaml
 - hdmi_cec_rmt.scan:
 ```
 
-All `destination`/`key`/`data` fields accept lambdas.
+All `destination`/`key`/`data`/`device`/`command` fields accept lambdas.
+
+Key names: `select` (`ok`), `up`, `down`, `left`, `right`, `home` (`root_menu`), `setup_menu`,
+`contents_menu`, `back` (`exit`, `menu`), `number_0`–`number_9`, `enter`, `channel_up`,
+`channel_down`, `info`, `power`, `volume_up`, `volume_down`, `mute`, `play`, `stop`, `pause`,
+`record`, `rewind`, `fast_forward`, `next`, `previous`, `power_toggle`, `power_off`, `power_on`,
+`red`, `green`, `yellow`, `blue`, and a few more (see `KEYS` in `__init__.py`).
+
+### Home Assistant
+
+The example config exposes one action, `cec_command(device, command)`, and fires
+`esphome.hdmi_cec_message` for every frame with `source_name`, `destination_name`, `command`
+(e.g. `Active Source`, `Standby`) and `key` (for remote keys). For example:
+
+```yaml
+# Pause the Apple TV when the doorbell rings
+actions:
+  - action: esphome.cec_controller_cec_command
+    data: {device: "Apple TV", command: pause}
+
+# Do something when the Apple TV becomes the active source
+triggers:
+  - trigger: event
+    event_type: esphome.hdmi_cec_message
+    event_data: {source_name: "Apple TV", command: "Active Source"}
+```
 
 ### Entities
 

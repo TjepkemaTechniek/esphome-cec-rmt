@@ -3,6 +3,7 @@
 #ifdef USE_ESP32
 
 #include "esphome/core/defines.h"
+#include "esphome/core/log.h"
 #include "hdmi_cec_rmt.h"
 
 #ifdef USE_SWITCH
@@ -41,10 +42,16 @@ class CecPowerSwitch : public switch_::Switch {
  protected:
   void write_state(bool state) override {
     auto *parent = this->device_->get_parent();
+    uint8_t la = this->device_->get_logical_address();
+    if (la == LA_NONE) {
+      ESP_LOGW("hdmi_cec_rmt", "'%s' has not been seen on the bus yet; can't switch it", this->device_->get_name().c_str());
+      this->publish_state(this->state);  // revert the UI
+      return;
+    }
     if (state) {
-      parent->power_on(this->device_->get_logical_address());
+      parent->power_on(la);
     } else {
-      parent->standby(this->device_->get_logical_address());
+      parent->standby(la);
     }
     this->has_published_ = true;
     this->publish_state(state);  // optimistic; corrected by the power status checks that follow
@@ -81,6 +88,8 @@ class CecSourceSelect : public select::Select, public Parented<HdmiCecRmt> {
     if (e.device == nullptr)
       return PA_UNKNOWN;
     uint8_t la = e.device->get_logical_address();
+    if (la >= 15)
+      return PA_UNKNOWN;
     return la == 0 ? 0x0000 : this->parent_->get_state(la).physical_address;
   }
   /// Name of the entry routed to this address, or nullptr.

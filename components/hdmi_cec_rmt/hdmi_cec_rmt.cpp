@@ -4,6 +4,7 @@
 #include "cec_entities.h"
 
 #include <cinttypes>
+#include <cstdlib>
 
 #include "esphome/core/log.h"
 
@@ -322,11 +323,130 @@ const char *opcode_name(uint8_t opcode) {
   }
 }
 
+// <User Control Pressed> keys (HDMI 1.4b CEC table 27). Keep in sync with KEYS in __init__.py.
+struct KeyEntry {
+  const char *name;
+  uint8_t code;
+};
+static const KeyEntry KEYS[] = {
+    {"select", 0x00},        {"ok", 0x00},           {"up", 0x01},
+    {"down", 0x02},          {"left", 0x03},         {"right", 0x04},
+    {"root_menu", 0x09},     {"home", 0x09},         {"setup_menu", 0x0A},
+    {"contents_menu", 0x0B}, {"favorite_menu", 0x0C}, {"back", 0x0D},
+    {"exit", 0x0D},          {"menu", 0x0D},         {"number_0", 0x20},
+    {"number_1", 0x21},      {"number_2", 0x22},     {"number_3", 0x23},
+    {"number_4", 0x24},      {"number_5", 0x25},     {"number_6", 0x26},
+    {"number_7", 0x27},      {"number_8", 0x28},     {"number_9", 0x29},
+    {"enter", 0x2B},         {"clear", 0x2C},        {"channel_up", 0x30},
+    {"channel_down", 0x31},  {"previous_channel", 0x32}, {"input_select", 0x34},
+    {"info", 0x35},          {"help", 0x36},         {"page_up", 0x37},
+    {"page_down", 0x38},     {"power", 0x40},        {"volume_up", 0x41},
+    {"volume_down", 0x42},   {"mute", 0x43},         {"play", 0x44},
+    {"stop", 0x45},          {"pause", 0x46},        {"record", 0x47},
+    {"rewind", 0x48},        {"fast_forward", 0x49}, {"eject", 0x4A},
+    {"next", 0x4B},          {"forward", 0x4B},      {"previous", 0x4C},
+    {"backward", 0x4C},      {"subtitle", 0x51},     {"epg", 0x53},
+    {"play_function", 0x60}, {"pause_play", 0x61},   {"stop_function", 0x64},
+    {"mute_function", 0x65}, {"restore_volume", 0x66}, {"select_media", 0x68},
+    {"select_av_input", 0x69}, {"select_audio_input", 0x6A}, {"power_toggle", 0x6B},
+    {"power_off", 0x6C},     {"power_on", 0x6D},     {"blue", 0x71},
+    {"red", 0x72},           {"green", 0x73},        {"yellow", 0x74},
+};
+
+static std::string normalize_name(const std::string &in) {
+  std::string out;
+  out.reserve(in.size());
+  for (char c : in) {
+    if (c == ' ' || c == '-') {
+      c = '_';
+    } else if (c >= 'A' && c <= 'Z') {
+      c = static_cast<char>(c - 'A' + 'a');
+    }
+    out += c;
+  }
+  while (!out.empty() && out.back() == '_')
+    out.pop_back();
+  return out;
+}
+
+static int parse_number(const std::string &s) {
+  if (s.empty())
+    return -1;
+  char *end = nullptr;
+  long v = strtol(s.c_str(), &end, 0);  // decimal, or hex with 0x
+  if (end == nullptr || *end != '\0' || v < 0 || v > 255)
+    return -1;
+  return static_cast<int>(v);
+}
+
+int key_code(const std::string &name) {
+  std::string n = normalize_name(name);
+  for (const auto &k : KEYS) {
+    if (n == k.name)
+      return k.code;
+  }
+  return parse_number(n);
+}
+
+const char *key_name(uint8_t code) {
+  for (const auto &k : KEYS) {
+    if (k.code == code)
+      return k.name;  // the first name listed is the main one
+  }
+  return "?";
+}
+
 // ---------------------------------------------------------------------------
 // CecDevice
 // ---------------------------------------------------------------------------
 
+uint8_t CecDevice::match_score(const DeviceState &s) const {
+  bool confirmed = false;
+  if (this->match_vendor_ && s.vendor_known) {
+    if (s.vendor_id != this->match_vendor_id_)
+      return 0;
+    confirmed = true;
+  }
+  if (!this->match_osd_name_.empty() && !s.osd_name.empty()) {
+    if (normalize_name(s.osd_name) != normalize_name(this->match_osd_name_))
+      return 0;
+    confirmed = true;
+  }
+  if (this->match_device_type_ != 0xFF && s.device_type != 0xFF) {
+    if (s.device_type != this->match_device_type_)
+      return 0;
+    confirmed = true;
+  }
+  return confirmed ? 2 : 1;
+}
+
+void CecDevice::restore() {
+  if (!this->is_auto())
+    return;
+  this->pref_ = global_preferences->make_preference<uint8_t>(fnv1_hash("hdmi_cec_rmt_dev_" + this->name_));
+  uint8_t la;
+  if (this->pref_.load(&la) && la < CEC_BROADCAST) {
+    this->saved_la_ = la;
+    this->la_ = la;  // provisional until the device confirms it, so commands work right after boot
+  }
+}
+
+bool CecDevice::bind(uint8_t la, bool remember) {
+  if (!this->is_auto())
+    return false;
+  if (remember && la != LA_NONE && la != this->saved_la_) {
+    this->saved_la_ = la;
+    this->pref_.save(&la);
+  }
+  if (la == this->la_)
+    return false;
+  this->la_ = la;
+  this->force_publish_ = true;
+  return true;
+}
+
 void CecDevice::publish(const DeviceState &state) {
+  this->force_publish_ = false;
 #ifdef USE_BINARY_SENSOR
   if (this->present_sensor_ != nullptr)
     this->present_sensor_->publish_state(state.present);
@@ -402,6 +522,8 @@ void HdmiCecRmt::setup() {
   this->states_[0].physical_address = 0x0000;  // the TV is always 0.0.0.0
   for (auto &st : this->states_)
     st.dirty = true;
+  for (auto *dev : this->devices_)
+    dev->restore();
 
   int before = this->bus_.level_before_driver(), after = this->bus_.level_after_driver();
   if (before == 0) {
@@ -420,8 +542,9 @@ void HdmiCecRmt::setup() {
     if (this->power_poll_interval_ != NEVER) {
       this->set_interval("power_poll", this->power_poll_interval_, [this]() {
         for (auto *dev : this->devices_) {
-          if (this->states_[dev->get_logical_address()].present)
-            this->request_power_status(dev->get_logical_address());
+          uint8_t la = dev->get_logical_address();
+          if (la < CEC_BROADCAST && this->states_[la].present)
+            this->request_power_status(la);
         }
       });
     }
@@ -440,16 +563,25 @@ void HdmiCecRmt::dump_config() {
                 "  OSD name: %s\n"
                 "  Vendor ID: %06" PRIX32 "\n"
                 "  Promiscuous: %s\n"
+                "  Passive: %s\n"
                 "  Monitor mode: %s\n"
                 "  Line level now: %s (self-test at boot: before driver %s, after driver %s)",
                 this->configured_la_, this->la_, format_physical_address(this->physical_address_).c_str(),
                 device_type_name(this->device_type_), this->osd_name_.c_str(), this->vendor_id_,
-                YESNO(this->promiscuous_), YESNO(this->monitor_mode_),
+                YESNO(this->promiscuous_), YESNO(this->passive_), YESNO(this->monitor_mode_),
                 this->is_failed() ? "?" : (this->bus_.line_is_low() ? "LOW (!)" : "high"),
                 this->bus_.level_before_driver() == 1 ? "high" : (this->bus_.level_before_driver() == 0 ? "LOW" : "?"),
                 this->bus_.level_after_driver() == 1 ? "high" : (this->bus_.level_after_driver() == 0 ? "LOW" : "?"));
-  for (auto *dev : this->devices_)
-    ESP_LOGCONFIG(TAG, "  Device '%s' at logical address %u", dev->get_name().c_str(), dev->get_logical_address());
+  for (auto *dev : this->devices_) {
+    if (!dev->is_auto()) {
+      ESP_LOGCONFIG(TAG, "  Device '%s' at logical address %u", dev->get_name().c_str(), dev->get_logical_address());
+    } else if (dev->get_logical_address() == LA_NONE) {
+      ESP_LOGCONFIG(TAG, "  Device '%s': auto-detect, not seen yet", dev->get_name().c_str());
+    } else {
+      ESP_LOGCONFIG(TAG, "  Device '%s': auto-detect, at logical address %u", dev->get_name().c_str(),
+                    dev->get_logical_address());
+    }
+  }
   if (this->is_failed())
     ESP_LOGE(TAG, "  Setup failed (RMT/GPTimer allocation)");
 }
@@ -459,6 +591,12 @@ void HdmiCecRmt::loop() {
   CecFrame frame;
   for (uint8_t i = 0; i < 8 && this->bus_.read_frame(frame); i++)
     this->handle_frame_(frame);
+  if (this->identity_dirty_) {
+    this->identity_dirty_ = false;
+    this->bind_devices_();
+    if (!this->scanning_)
+      this->announce_new_devices_();
+  }
   this->process_tx_();
   this->route_tick_();
   this->publish_states_();
@@ -495,6 +633,12 @@ void HdmiCecRmt::allocate_logical_address_() {
     }
     this->bus_.set_logical_address(this->la_);
     this->allocated_ = true;
+    if (this->passive_) {
+      // Passive: claim the address (so we ACK what is sent to us) and stay quiet. Everything else
+      // is learned from the traffic; we only answer when asked.
+      ESP_LOGI(TAG, "Passive mode: learning devices from bus traffic, not polling");
+      return;
+    }
     if (this->la_ != CEC_BROADCAST)
       this->report_physical_address_();
     // Ask who is active right now; the active source answers with <Active Source>.
@@ -727,6 +871,7 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
         s.physical_address = static_cast<uint16_t>((d[2] << 8) | d[3]);
         s.device_type = d[4];
         s.dirty = true;
+        this->identity_dirty_ = true;
         this->active_dirty_ = true;  // the name for the active address may resolve now
       }
       break;
@@ -737,6 +882,7 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
       if (name != s.osd_name) {
         s.osd_name = name;
         s.dirty = true;
+        this->identity_dirty_ = true;
         this->active_dirty_ = true;
       }
       break;
@@ -746,6 +892,7 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
         s.vendor_id = (uint32_t(d[2]) << 16) | (uint32_t(d[3]) << 8) | d[4];
         s.vendor_known = true;
         s.dirty = true;
+        this->identity_dirty_ = true;
       }
       break;
     case OP_REPORT_POWER_STATUS:
@@ -778,6 +925,10 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
       break;
     case OP_SET_STREAM_PATH:
     case OP_ROUTING_INFORMATION:
+      if (src == 0 && f.opcode() == OP_SET_STREAM_PATH && this->states_[0].power != POWER_ON) {
+        this->states_[0].power = POWER_ON;  // a TV only picks an input while it is on
+        this->states_[0].dirty = true;
+      }
       if (f.len >= 4) {
         uint16_t pa = static_cast<uint16_t>((d[2] << 8) | d[3]);
         // The TV routing somewhere else (e.g. the user picked a source) ends our stand-in role,
@@ -790,6 +941,10 @@ void HdmiCecRmt::update_state_(const CecFrame &f) {
       this->schedule_state_refresh_();  // routing messages are hints; confirm who is really active
       break;
     case OP_ROUTING_CHANGE:
+      if (src == 0 && this->states_[0].power != POWER_ON) {
+        this->states_[0].power = POWER_ON;
+        this->states_[0].dirty = true;
+      }
       if (f.len >= 6)
         this->set_active_pa_(static_cast<uint16_t>((d[4] << 8) | d[5]));
       this->schedule_state_refresh_();
@@ -924,7 +1079,9 @@ void HdmiCecRmt::mark_seen_(uint8_t la) {
   if (!s.present) {
     s.present = true;
     s.dirty = true;
-    if (!this->scanning_ && this->allocated_ && !this->monitor_mode_)
+    this->identity_dirty_ = true;
+    // Passive: don't ask a new device anything; it tells who it is when it talks to the TV.
+    if (!this->scanning_ && this->allocated_ && !this->monitor_mode_ && !this->passive_)
       this->query_device_(la);
   }
 }
@@ -937,6 +1094,81 @@ void HdmiCecRmt::mark_absent_(uint8_t la) {
     s.present = false;
     s.power = POWER_UNKNOWN;
     s.dirty = true;
+    this->identity_dirty_ = true;
+  }
+}
+
+void HdmiCecRmt::bind_devices_() {
+  uint16_t taken = 0;  // addresses owned by fixed devices or already bound auto devices
+  for (auto *dev : this->devices_) {
+    if (!dev->is_auto())
+      taken |= 1u << dev->get_logical_address();
+  }
+  for (auto *dev : this->devices_) {
+    if (!dev->is_auto())
+      continue;
+    uint8_t cur = dev->get_logical_address();
+    uint8_t cur_score = 0;
+    if (cur < CEC_BROADCAST && !(taken & (1u << cur))) {
+      cur_score = dev->match_score(this->states_[cur]);
+      if (!this->states_[cur].present && cur_score == 2)
+        cur_score = 1;  // gone from there: look elsewhere, but keep it if it isn't found
+    }
+    uint8_t best = LA_NONE;
+    if (cur_score < 2) {
+      // Look for an address where the device has identified itself.
+      for (uint8_t la = 0; la < CEC_BROADCAST; la++) {
+        if (la == this->la_ || (taken & (1u << la)) || !this->states_[la].present)
+          continue;
+        if (dev->match_score(this->states_[la]) == 2) {
+          best = la;
+          break;
+        }
+      }
+    }
+    uint8_t target;
+    bool confirmed;
+    if (best != LA_NONE) {
+      target = best;
+      confirmed = true;
+    } else if (cur_score >= 1) {
+      target = cur;  // keep (confirmed, or remembered and not contradicted)
+      confirmed = cur_score == 2;
+    } else {
+      target = LA_NONE;
+      confirmed = false;
+    }
+    if (dev->bind(target, confirmed)) {
+      if (target == LA_NONE) {
+        ESP_LOGI(TAG, "'%s' is no longer at logical address %u", dev->get_name().c_str(), cur);
+      } else {
+        ESP_LOGI(TAG, "Found '%s' at logical address %u", dev->get_name().c_str(), target);
+      }
+      this->active_dirty_ = true;  // display names may have changed
+    }
+    if (target < CEC_BROADCAST)
+      taken |= 1u << target;
+  }
+}
+
+void HdmiCecRmt::announce_new_devices_() {
+  for (uint8_t la = 0; la < CEC_BROADCAST; la++) {
+    DeviceState &s = this->states_[la];
+    if (!s.present || s.announced || la == this->la_)
+      continue;
+    bool configured = false;
+    for (auto *dev : this->devices_)
+      configured |= dev->get_logical_address() == la;
+    if (configured) {
+      s.announced = true;
+      continue;
+    }
+    // Outside a scan, wait until the device has said something about itself.
+    if (!this->scanning_ && s.osd_name.empty() && s.physical_address == PA_UNKNOWN)
+      continue;
+    s.announced = true;
+    for (auto *t : this->discovered_triggers_)
+      t->trigger(la, s.physical_address, s.osd_name);
   }
 }
 
@@ -1000,7 +1232,7 @@ void HdmiCecRmt::scan() {
 }
 
 void HdmiCecRmt::finish_scan_() {
-  this->scanning_ = false;
+  this->bind_devices_();
   ESP_LOGI(TAG, "CEC bus scan complete:");
   ESP_LOGI(TAG, "  LA  Name              Phys.addr  Type          Vendor        Power");
   for (uint8_t la = 0; la < CEC_BROADCAST; la++) {
@@ -1026,19 +1258,8 @@ void HdmiCecRmt::finish_scan_() {
              power_name(s.power));
   }
 
-  for (uint8_t la = 0; la < CEC_BROADCAST; la++) {
-    DeviceState &s = this->states_[la];
-    if (!s.present || s.announced || la == this->la_)
-      continue;
-    s.announced = true;
-    bool configured = false;
-    for (auto *dev : this->devices_)
-      configured |= dev->get_logical_address() == la;
-    if (configured)
-      continue;
-    for (auto *t : this->discovered_triggers_)
-      t->trigger(la, s.physical_address, s.osd_name);
-  }
+  this->announce_new_devices_();
+  this->scanning_ = false;
 }
 
 std::string HdmiCecRmt::display_name(uint8_t la) const {
@@ -1063,10 +1284,14 @@ void HdmiCecRmt::publish_states_() {
   bool any = false;
   for (auto &s : this->states_)
     any |= s.dirty;
+  for (auto *dev : this->devices_)
+    any |= dev->needs_publish();
   if (any) {
+    static const DeviceState NOT_FOUND{};
     for (auto *dev : this->devices_) {
-      const DeviceState &s = this->states_[dev->get_logical_address()];
-      if (s.dirty)
+      uint8_t la = dev->get_logical_address();
+      const DeviceState &s = la < CEC_BROADCAST ? this->states_[la] : NOT_FOUND;
+      if (s.dirty || dev->needs_publish())
         dev->publish(s);
     }
     for (auto &s : this->states_)
@@ -1136,6 +1361,56 @@ void HdmiCecRmt::publish_stats_() {
 // Actions
 // ---------------------------------------------------------------------------
 
+uint8_t HdmiCecRmt::find_device(const std::string &name) const {
+  std::string n = normalize_name(name);
+  if (n.empty())
+    return LA_NONE;
+  if (n == "all" || n == "broadcast")
+    return CEC_BROADCAST;
+  for (auto *dev : this->devices_) {
+    if (normalize_name(dev->get_name()) == n)
+      return dev->get_logical_address();  // LA_NONE if not found on the bus yet
+  }
+  for (uint8_t la = 0; la < CEC_BROADCAST; la++) {
+    if (!this->states_[la].osd_name.empty() && normalize_name(this->states_[la].osd_name) == n)
+      return la;
+  }
+  for (uint8_t la = 0; la < CEC_BROADCAST; la++) {
+    if (normalize_name(default_la_name(la)) == n)
+      return la;
+  }
+  int num = parse_number(n);
+  return num >= 0 && num <= CEC_BROADCAST ? static_cast<uint8_t>(num) : LA_NONE;
+}
+
+bool HdmiCecRmt::command(const std::string &device, const std::string &command) {
+  uint8_t la = this->find_device(device);
+  if (la == LA_NONE) {
+    ESP_LOGW(TAG, "Command '%s': device '%s' is unknown or not found on the bus yet", command.c_str(),
+             device.c_str());
+    return false;
+  }
+  std::string c = normalize_name(command);
+  if (c == "on" || c == "wake" || c == "turn_on") {
+    this->power_on(la);
+  } else if (c == "off" || c == "standby" || c == "turn_off") {
+    this->standby(la);
+  } else if (c == "switch_to" || c == "active_source" || c == "source") {
+    this->set_active_source(la);
+  } else if (c == "power_status" || c == "refresh") {
+    this->request_power_status(la);
+  } else {
+    int key = key_code(c);
+    if (key < 0) {
+      ESP_LOGW(TAG, "Unknown command '%s'", command.c_str());
+      return false;
+    }
+    this->user_control(la, static_cast<uint8_t>(key));
+  }
+  ESP_LOGD(TAG, "Command '%s' -> %s (logical address %u)", c.c_str(), this->display_name(la).c_str(), la);
+  return true;
+}
+
 void HdmiCecRmt::send(uint8_t destination, const std::vector<uint8_t> &data, int source) {
   TxRequest req;
   uint8_t src = source < 0 ? this->la_ : static_cast<uint8_t>(source & 0x0F);
@@ -1197,7 +1472,9 @@ void HdmiCecRmt::request_power_status(uint8_t destination) {
 }
 
 void HdmiCecRmt::schedule_state_refresh_(bool ours) {
-  if (this->monitor_mode_ || !this->allocated_)
+  // Passive: never ask every device for its state. After our own commands, only the device we
+  // addressed is asked (schedule_power_check_), the rest follows from the bus.
+  if (this->monitor_mode_ || !this->allocated_ || this->passive_)
     return;
   // Bus-triggered refreshes have a cooldown: our own Request Active Source can make devices
   // send routing/system-audio messages, which must not trigger the next refresh in a loop.
