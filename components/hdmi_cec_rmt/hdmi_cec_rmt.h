@@ -12,6 +12,7 @@
 #include "esphome/core/defines.h"
 #include "esphome/core/gpio.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/preferences.h"
 
 #ifdef USE_BINARY_SENSOR
 #include "esphome/components/binary_sensor/binary_sensor.h"
@@ -38,6 +39,7 @@ static constexpr uint8_t POWER_TO_ON = 0x02;
 static constexpr uint8_t POWER_TO_STANDBY = 0x03;
 static constexpr uint8_t POWER_UNKNOWN = 0xFF;
 static constexpr uint16_t PA_UNKNOWN = 0xFFFF;
+static constexpr uint8_t LA_NONE = 0xFF;  // device not (yet) found on the bus
 
 enum class SourceSwitchMethod : uint8_t { SET_STREAM_PATH, ACTIVE_SOURCE, BOTH };
 
@@ -57,16 +59,44 @@ struct DeviceState {
 std::string format_physical_address(uint16_t pa);
 const char *vendor_name(uint32_t vendor_id);
 const char *opcode_name(uint8_t opcode);
+/// <User Control Pressed> key code for a name like "play", "select", "volume_up" (case and
+/// spaces/dashes don't matter), or a number ("0x44", "68"). -1 if unknown.
+int key_code(const std::string &name);
+/// Name of a <User Control Pressed> key code, e.g. "play"; "?" if unknown.
+const char *key_name(uint8_t code);
 
 /// A device declared in YAML (`devices:`); entities attach to it.
+///
+/// With a fixed `logical_address` it is always that address. Without one it is found on the
+/// bus by what it tells about itself (vendor ID, OSD name, device type), whichever logical
+/// address it got. The last address it was found at is remembered across reboots.
 class CecDevice {
  public:
-  CecDevice(uint8_t logical_address, const char *name) : logical_address_(logical_address), name_(name) {}
+  CecDevice(uint8_t logical_address, const char *name)
+      : fixed_la_(logical_address), la_(logical_address), name_(name) {}
 
-  uint8_t get_logical_address() const { return this->logical_address_; }
+  /// Current logical address, LA_NONE if not found on the bus yet.
+  uint8_t get_logical_address() const { return this->la_; }
+  bool is_auto() const { return this->fixed_la_ == LA_NONE; }
   const std::string &get_name() const { return this->name_; }
   void set_parent(HdmiCecRmt *parent) { this->parent_ = parent; }
   HdmiCecRmt *get_parent() const { return this->parent_; }
+
+  void set_match_vendor_id(uint32_t vendor_id) {
+    this->match_vendor_ = true;
+    this->match_vendor_id_ = vendor_id;
+  }
+  void set_match_osd_name(const std::string &name) { this->match_osd_name_ = name; }
+  void set_match_device_type(uint8_t type) { this->match_device_type_ = type; }
+
+  /// How well what we know about an address fits this device:
+  /// 0 = contradicts, 1 = nothing known yet, 2 = confirmed by at least one property.
+  uint8_t match_score(const DeviceState &state) const;
+  /// Load the remembered address (auto devices only).
+  void restore();
+  /// Returns true if the address changed.
+  bool bind(uint8_t la, bool remember);
+  bool needs_publish() const { return this->force_publish_; }
 
 #ifdef USE_BINARY_SENSOR
   void set_present_binary_sensor(binary_sensor::BinarySensor *s) { this->present_sensor_ = s; }
@@ -81,9 +111,17 @@ class CecDevice {
   void publish(const DeviceState &state);
 
  protected:
-  uint8_t logical_address_;
+  uint8_t fixed_la_;
+  uint8_t la_;
   std::string name_;
   HdmiCecRmt *parent_{nullptr};
+  bool match_vendor_{false};
+  uint32_t match_vendor_id_{0};
+  std::string match_osd_name_;
+  uint8_t match_device_type_{0xFF};
+  ESPPreferenceObject pref_;
+  uint8_t saved_la_{LA_NONE};
+  bool force_publish_{true};
 #ifdef USE_BINARY_SENSOR
   binary_sensor::BinarySensor *present_sensor_{nullptr};
 #endif
@@ -136,6 +174,7 @@ class HdmiCecRmt : public Component {
   void set_vendor_id(uint32_t vendor_id) { this->vendor_id_ = vendor_id; }
   void set_promiscuous(bool promiscuous) { this->promiscuous_ = promiscuous; }
   void set_monitor_mode(bool monitor) { this->monitor_mode_ = monitor; }
+  void set_passive(bool passive) { this->passive_ = passive; }
   void set_scan_interval(uint32_t ms) { this->scan_interval_ = ms; }
   void set_power_poll_interval(uint32_t ms) { this->power_poll_interval_ = ms; }
   void set_stats_interval(uint32_t ms) { this->stats_interval_ = ms; }
@@ -180,6 +219,13 @@ class HdmiCecRmt : public Component {
   /// Print the last frames (RX and TX results) with timestamps to the log.
   void dump_history();
   void scan();
+  /// Logical address for a device name: the YAML name or the OSD name (case-insensitive), a
+  /// default name like "TV" or "Playback 1", "all"/"broadcast" (15), or a number. LA_NONE if unknown.
+  uint8_t find_device(const std::string &name) const;
+  /// Send a command by name to a device by name, e.g. ("Apple TV", "play").
+  /// Commands: on, standby (or off), switch_to (make it the active source), power_status,
+  /// or any key name accepted by key_code(). Returns false if device or command is unknown.
+  bool command(const std::string &device, const std::string &command);
 
   // ---- state ----
   uint8_t get_logical_address() const { return this->la_; }
@@ -213,6 +259,9 @@ class HdmiCecRmt : public Component {
   void mark_absent_(uint8_t la);
   void query_device_(uint8_t la);
   void finish_scan_();
+  void bind_devices_();
+  void announce_new_devices_();
+  bool identity_dirty_{false};
   void set_active_pa_(uint16_t pa);
   void publish_states_();
   void publish_stats_();
@@ -283,6 +332,7 @@ class HdmiCecRmt : public Component {
   uint32_t vendor_id_{0};
   bool promiscuous_{true};
   bool monitor_mode_{false};
+  bool passive_{true};
   uint32_t scan_interval_{300000};
   uint32_t power_poll_interval_{60000};
   uint32_t stats_interval_{60000};

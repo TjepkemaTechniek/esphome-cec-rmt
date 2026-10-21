@@ -37,8 +37,22 @@ logger:
 api:
   encryption:
     key: !secret cec_api_key
-  # Raw actions so anything can be scripted from Home Assistant
   actions:
+    # The easy one: a command by name to a device by name, e.g.
+    #   action: esphome.cec_controller_cec_command
+    #   data: {device: "Apple TV", command: "play"}
+    # device: a name from `devices:` below, the device's own CEC name, "TV", "all", or 0-15.
+    # command: on, standby, switch_to, power_status, or a key: play, pause, stop, select,
+    #   up, down, left, right, back, home, volume_up, volume_down, mute, fast_forward, ...
+    - action: cec_command
+      variables:
+        device: string
+        command: string
+      then:
+        - hdmi_cec_rmt.command:
+            device: !lambda "return device;"
+            command: !lambda "return command;"
+    # Raw actions so anything else can be scripted from Home Assistant
     - action: cec_send
       variables:
         destination: int
@@ -98,6 +112,10 @@ captive_portal:
 hdmi_cec_rmt:
   id: cec
   pin: ${cec_pin}
+  # Passive (the default): never polls the bus. Devices, names, power and the active source
+  # are learned from the traffic between the TV and the other devices; we ACK and answer what
+  # is sent to us, and only transmit for commands you give. Set to false to poll as before.
+  passive: true
   # 14 = "Specific Use": a controller that doesn't show up as an input.
   # If your TV ignores address 14, switch to a free playback address (8 or 11).
   logical_address: 14
@@ -105,25 +123,31 @@ hdmi_cec_rmt:
   # Set this to a port with nothing plugged in (0x3000 = HDMI 3).
   physical_address: 0x3000
   osd_name: "Home Assistant"
-  scan_interval: 5min           # Full poll of addresses 0-14; also on boot and on demand
+  # scan_interval: 5min         # Off in passive mode; the "Scan CEC bus" button still works
   promiscuous: true             # Decode and report ALL traffic, but only ACK our own address
 
-  # Devices you want entities for. Discovery fills in name/vendor/physical address
-  # and power at runtime. Anything else that shows up is reported as an event.
-  # Fill this in from the first scan (task list step 6).
+  # Devices you want entities for. Give a fixed logical_address, or leave it out and let the
+  # device be found by what it says about itself (vendor_id, osd_name, device_type): a playback
+  # device can end up at 4, 8 or 11 depending on what else is connected. The address it was
+  # last found at is remembered, so commands work right after a reboot.
+  # Anything else that shows up is reported with on_device_discovered.
   devices:
     - id: tv
       logical_address: 0
       name: TV
-    - id: player
-      logical_address: 4
-      name: Media player
+    - id: apple_tv
+      name: Apple TV
+      vendor_id: 0x0010FA        # Apple
+      osd_name: Apple TV
     - id: audio_system
       logical_address: 5
       name: Audio system
 
-  # Every received frame becomes a Home Assistant event, for automations.
-  # Requires "Allow the device to perform Home Assistant actions" (task list step 7).
+  # Every received frame becomes a Home Assistant event, for automations. Trigger on e.g.
+  #   event_type: esphome.hdmi_cec_message
+  #   event_data: {source_name: "Apple TV", command: "Active Source"}
+  # or a remote key sent to the Apple TV: {destination_name: "Apple TV", key: "play"}.
+  # Requires "Allow the device to perform Home Assistant actions" in the ESPHome integration.
   on_message:
     - then:
         - homeassistant.event:
@@ -131,7 +155,10 @@ hdmi_cec_rmt:
             data:
               source: !lambda "return to_string(source);"
               destination: !lambda "return to_string(destination);"
-              opcode: !lambda "return data.empty() ? std::string(\"poll\") : format_hex(data[0]);"
+              source_name: !lambda "return id(cec).display_name(source);"
+              destination_name: !lambda "return destination == 15 ? std::string(\"all\") : id(cec).display_name(destination);"
+              command: !lambda "return data.empty() ? std::string(\"Poll\") : std::string(hdmi_cec_rmt::opcode_name(data[0]));"
+              key: !lambda "return data.size() >= 2 && data[0] == 0x44 ? std::string(hdmi_cec_rmt::key_name(data[1])) : std::string();"
               data: !lambda "return format_hex_pretty(data, ':', false);"
 
   # A device we don't have in `devices:` answered a poll
@@ -157,8 +184,8 @@ switch:
     device: tv
     name: TV power
   - platform: hdmi_cec_rmt
-    device: player
-    name: Media player power
+    device: apple_tv
+    name: Apple TV power
   - platform: hdmi_cec_rmt
     device: audio_system
     name: Audio system power
@@ -169,9 +196,9 @@ binary_sensor:
     present:
       name: TV connected
   - platform: hdmi_cec_rmt
-    device: player
+    device: apple_tv
     present:
-      name: Media player connected
+      name: Apple TV connected
   - platform: hdmi_cec_rmt
     device: audio_system
     present:
@@ -179,14 +206,14 @@ binary_sensor:
 
 text_sensor:
   - platform: hdmi_cec_rmt
-    device: player
+    device: apple_tv
     osd_name:
-      name: Media player CEC name
+      name: Apple TV CEC name
     physical_address:
-      name: Media player HDMI address
+      name: Apple TV HDMI address
       entity_category: diagnostic
     vendor_id:
-      name: Media player vendor
+      name: Apple TV vendor
       entity_category: diagnostic
   - platform: hdmi_cec_rmt
     device: audio_system
@@ -210,7 +237,7 @@ select:
   # active source changes by other means.
   - platform: hdmi_cec_rmt
     name: HDMI source
-    devices: [tv, player]
+    devices: [tv, apple_tv]
 
 sensor:
   # Diagnostics for the transport. tx_nack and rx_ack_missed are the numbers
@@ -262,35 +289,35 @@ button:
     icon: mdi:volume-plus
     on_press:
       - hdmi_cec_rmt.user_control:
-          destination: 5
-          key: 0x41
+          device: audio_system
+          key: volume_up
   - platform: template
     name: Volume down
     icon: mdi:volume-minus
     on_press:
       - hdmi_cec_rmt.user_control:
-          destination: 5
-          key: 0x42
+          device: audio_system
+          key: volume_down
   - platform: template
     name: Mute
     icon: mdi:volume-mute
     on_press:
       - hdmi_cec_rmt.user_control:
-          destination: 5
-          key: 0x43
+          device: audio_system
+          key: mute
 
-  # Remote keys to the Media player
+  # Remote keys to the Apple TV, wherever it is on the bus
   - platform: template
-    name: Player play-pause
+    name: Apple TV play-pause
     icon: mdi:play-pause
     on_press:
       - hdmi_cec_rmt.user_control:
-          destination: 4
-          key: 0x44              # Play (many players toggle)
+          device: apple_tv
+          key: play              # The Apple TV toggles on play
   - platform: template
-    name: Player menu
+    name: Apple TV menu
     icon: mdi:menu
     on_press:
       - hdmi_cec_rmt.user_control:
-          destination: 4
-          key: 0x0D              # Exit/back
+          device: apple_tv
+          key: back
