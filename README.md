@@ -57,7 +57,7 @@ A complete Home Assistant controller config is in [`examples/cec-controller.yaml
 | `pin` | required | Bus pin (open-drain is configured by the component) |
 | `logical_address` | `14` | Claimed at boot by polling it; falls back to 15 (unregistered) if taken |
 | `physical_address` | required | e.g. `0x3000` = 3.0.0.0 |
-| `device_type` | from address | Reported in `<Report Physical Address>` |
+| `device_type` | from address | Reported in `<Report Physical Address>`. For addresses 12–15 (incl. the default 14) this is `6` (pure CEC switch), a non-source type, so the TV/receiver never routes to the controller's own port. Don't set a source type (1, 3, 4) unless you want that |
 | `osd_name` | `ESPHome` | Max 14 chars |
 | `vendor_id` | `0` | 24-bit IEEE OUI |
 | `promiscuous` | `true` | Decode and report traffic between other devices (needed to track state) |

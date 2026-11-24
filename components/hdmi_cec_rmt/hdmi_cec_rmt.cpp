@@ -96,7 +96,11 @@ static uint8_t default_device_type(uint8_t la) {
     case 5:
       return 5;  // Audio system
     default:
-      return 1;  // Specific use / reserved: present as a recording device (passive, not an input)
+      // Specific use / reserved / unregistered: present as a pure CEC switch. That is not a
+      // source, so a TV or receiver never treats our port as an input to route to. (A recording
+      // device is a source: a Philips TV picked our port for <System Audio Mode Request> once it
+      // learned our physical address, and the receiver switched to that input.)
+      return 6;
   }
 }
 
@@ -518,6 +522,17 @@ void HdmiCecRmt::report_physical_address_() {
 void HdmiCecRmt::enqueue_(TxRequest &&req, bool front) {
   if (this->monitor_mode_) {
     ESP_LOGW(TAG, "Monitor mode is enabled; not sending anything");
+    return;
+  }
+  // We are a controller, never a source: never claim our own port as the active source, whatever
+  // path asked for it (proxying an input, an action, a raw send). A receiver follows such a claim
+  // and switches to whatever input our port is assigned to.
+  if (req.frame.len >= 4 && req.frame.data[1] == OP_ACTIVE_SOURCE &&
+      static_cast<uint16_t>((req.frame.data[2] << 8) | req.frame.data[3]) == this->physical_address_) {
+    ESP_LOGW(TAG, "Not announcing our own port %s as the active source",
+             format_physical_address(this->physical_address_).c_str());
+    if (req.done)
+      req.done(false);
     return;
   }
   if (this->tx_queue_.size() >= TX_QUEUE_MAX) {
